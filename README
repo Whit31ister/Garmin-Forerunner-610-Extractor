@@ -1,58 +1,762 @@
-Requirements
-==============================================================================
+# in a searchable and filterable list. To get started, you should [create a pull request](https://github.com/superm1/Garmin-Forerunner-610-Extractor/compare).Garmin Forerunner ANT-FS Extractor
 
-- PyUSB 1.0 (seems to be a bug which makes it segfaults on version before
-  Alpha 2). It is recommended to use pip to install PyUSB:
-  
-  pip install pyusb
+A Linux/Python utility for downloading activity files from Garmin sport watches that communicate over **ANT-FS**.
 
-- Install udev rules (recommended). This is only needed if you want to avoid
-  running the program as root. Install with:
+The project was originally developed to provide a way to retrieve activity data from older Garmin devices without relying on Garmin's proprietary desktop software. It communicates with the watch through a compatible ANT USB stick, performs the ANT-FS discovery and authentication sequence, enumerates the files exposed by the watch, and downloads missing activity files in their original FIT format.
 
-  sudo cp resources/ant-usbstick2.rules /etc/udev/rules.d
+The project is derived from [`Tigge/antfs-cli`](https://github.com/Tigge/antfs-cli) and contains its own ANT/ANT-FS implementation under `ant/`. The repository is licensed under the MIT License.
 
-Supported devices
-==============================================================================
+## What it does
 
-Any compliant ANT-FS device should in theory work. Users of these device have
-been able to download data of their watches:
+The extractor sits between an ANT USB stick and an ANT-FS capable watch:
 
- - Garmin Forerunner 60
- - Garmin Forerunner 405CX
- - Garmin Forerunner 310XT
- - Garmin Forerunner 610
- - Garmin Forerunner 910XT
- - Garmin FR70
- - Garmin Swim
+```text
+Garmin Watch
+     │
+     │ ANT-FS
+     ▼
+ANT USB Stick
+     │
+     │ USB
+     ▼
+Python ANT stack
+     │
+     ▼
+garmin.py
+     │
+     ├── authenticate with watch
+     ├── enumerate remote files
+     ├── compare remote files with local files
+     └── download missing FIT files
+             │
+             ▼
+      ~/.config/garmin-extractor/
+```
 
-It's possible that other manufactures using ANT+/ANT-FS, such as Suunto and
-Timex might work, but have *never* been tested as far as I know. Please let
-me know if you have any success with devices that are not listed here.
+The important distinction is that the program does **not** convert activities into FIT files itself. The watch already exposes its activity recordings as files through ANT-FS. The extractor transfers those files to the host without requiring Garmin Connect or Garmin's desktop application.
 
-Usage
-==============================================================================
+## Supported devices
 
-Usage: python garmin.py
+The implementation targets compliant ANT-FS devices. The following Garmin devices have been reported to work with this project:
 
-This program extracts all activity FIT files from a device and writes them
-to a folder (see file locations below). The first time it runs it attempts
-to sync with the watch. This produces an authfile which is written to the
-same folder. On startup this program will try to read that file to avoid
-having to re-sync.
+* Garmin Forerunner 60
+* Garmin Forerunner 405CX
+* Garmin Forerunner 310XT
+* Garmin Forerunner 610
+* Garmin Forerunner 910XT
+* Garmin FR70
+* Garmin Swim
 
-File locations
-==============================================================================
+Other manufacturers that implemented ANT-FS, including some Suunto and Timex devices, may work if their ANT-FS implementation is compatible, but they are not considered tested by this project.
 
-Simple answer (probably correct for most people):
+### ANT USB hardware
 
- - Your files are placed in ~/.config/garmin-extractor/
+The code is configured for the Dynastream ANTUSB2 device:
 
-Correct answer:
+```text
+Vendor ID:  0x0fcf
+Product ID: 0x1008
+```
 
- - FIT files and authfiles are stored in an the location specified by the XDG
-   Base Directory specification. It uses the $XDG_CONFIG_HOME with
-   $HOME/.config as backup. In this directory a garmin-extractor folder is
-   created in which a folder for each device is created. Both the .FIT files
-   and authfile are stored in this device-specific folder.
+These identifiers are used by `garmin.py` when configuring the ANT application and are also reflected in the supplied udev rule.
 
+## Requirements
 
+The original implementation targets an older Python environment and depends on the Python ANT stack included in this repository.
+
+### Python dependencies
+
+The original project requires:
+
+* Python
+* PyUSB 1.0
+* A working USB backend such as `libusb`
+* The ANT/ANT-FS implementation contained in `ant/`
+
+Install PyUSB with:
+
+```bash
+pip install pyusb
+```
+
+The codebase predates modern Python 3 conventions and contains Python 2 syntax. If running it on a modern distribution, expect that additional porting work may be required.
+
+## USB permissions
+
+The ANT USB stick normally requires access to the USB device from the current user.
+
+The repository includes a udev rule:
+
+```text
+resources/ant-usbstick2.rules
+```
+
+Install it with:
+
+```bash
+sudo cp resources/ant-usbstick2.rules /etc/udev/rules.d/
+```
+
+Then reload the udev configuration or reconnect the ANT USB stick.
+
+The purpose of the rule is to allow the extractor to communicate with the ANT stick without requiring the entire program to run as root.
+
+## Usage
+
+Run the extractor from the repository:
+
+```bash
+python garmin.py
+```
+
+The program starts the ANT application and waits for a compatible device.
+
+A normal session follows this sequence:
+
+```text
+Start program
+     │
+     ▼
+Initialize configuration directories
+     │
+     ▼
+Initialize ANT channel
+     │
+     ▼
+Search for ANT-FS device
+     │
+     ▼
+Device discovered
+     │
+     ▼
+ANT-FS link established
+     │
+     ▼
+Authentication
+     │
+     ├── Existing authfile → authenticate with saved passkey
+     │
+     └── No authfile → pair with watch and save passkey
+     │
+     ▼
+Enumerate remote files
+     │
+     ▼
+Compare with local activities
+     │
+     ▼
+Download missing files
+     │
+     ▼
+Run local post-download scripts
+```
+
+On the first connection to a watch, the program performs pairing. The resulting authentication key is saved locally. Subsequent connections use that key instead of requiring the watch to be paired again.
+
+## How the implementation works
+
+### 1. ANT device discovery
+
+`garmin.py` defines the ANT USB device identifiers and derives its main `Garmin` class from the ANT-FS `Application` class:
+
+```python
+class Garmin(Application):
+    ID_VENDOR = 0x0fcf
+    ID_PRODUCT = 0x1008
+    PRODUCT_NAME = "garmin-extractor"
+```
+
+The application configures an ANT channel with the parameters expected by the ANT-FS device:
+
+```python
+channel.set_period(4096)
+channel.set_search_timeout(255)
+channel.set_rf_freq(50)
+channel.set_search_waveform([0x53, 0x00])
+channel.set_id(0, 0x01, 0)
+channel.open()
+```
+
+Once the channel is open, the ANT stack searches for a compatible device.
+
+### 2. ANT-FS linking
+
+When a device beacon is detected, `on_link()` is called.
+
+The application obtains the device information from the beacon and then transitions into the ANT-FS link procedure:
+
+```python
+def on_link(self, beacon):
+    self.link()
+    return True
+```
+
+The actual low-level ANT messaging is handled by the ANT implementation under `ant/`; `garmin.py` primarily provides the application-level callbacks and file handling logic.
+
+### 3. Authentication and pairing
+
+After the link is established, the program determines the watch serial number and name:
+
+```python
+self.serial, self.name = self.authentication_serial()
+```
+
+The serial number is also used as the identifier for the watch's local storage directory.
+
+The program then checks whether an authentication key already exists:
+
+```text
+~/.config/garmin-extractor/<serial>/authfile
+```
+
+If one exists, it is loaded and passed to the ANT-FS authentication layer.
+
+If one does not exist, the application initiates pairing:
+
+```python
+self.passkey = self.authentication_pair(self.PRODUCT_NAME)
+```
+
+The returned passkey is then stored for future sessions.
+
+This is why the first connection behaves differently from later connections. Pairing establishes a persistent authentication credential; subsequent runs can reuse it.
+
+## Authentication storage
+
+Authentication keys are stored per device rather than globally.
+
+The structure is:
+
+```text
+~/.config/garmin-extractor/
+└── <device-serial>/
+    ├── authfile
+    └── activities/
+        ├── activity-1.fit
+        ├── activity-2.fit
+        └── ...
+```
+
+The serial number separates multiple watches that may be used with the same computer.
+
+The implementation creates both the device directory and its `activities` directory when a new authentication key is written.
+
+Treat the `authfile` as sensitive device authentication data. Do not publish or commit it to a repository.
+
+## 4. File enumeration
+
+Once authenticated, `on_transport()` requests the device's download directory:
+
+```python
+directory = self.download_directory()
+```
+
+The remote file list is obtained from the ANT-FS directory object.
+
+The first two entries are skipped:
+
+```python
+remote_files = directory.get_files()[2:]
+```
+
+The remaining entries represent files available for transfer from the watch.
+
+The extractor then compares the remote filenames against the files already present in the local `activities` directory.
+
+## 5. Detecting missing activities
+
+The program does not blindly download every file on every run.
+
+For each remote file, it generates a deterministic filename based on:
+
+* activity timestamp
+* file type
+* file size
+
+The resulting format is:
+
+```text
+YYYY-MM-DD_HH-MM-SS-<type>-<size>.fit
+```
+
+For example:
+
+```text
+2012-08-14_17-42-03-01-12345.fit
+```
+
+The generated name is then compared against the local `activities` directory.
+
+Only files that do not already exist locally are downloaded.
+
+This makes repeated executions effectively incremental:
+
+```text
+Watch
+  │
+  ├── Activity A ───── already downloaded ──┐
+  ├── Activity B ───── already downloaded ──┤
+  └── Activity C ───── new ────────────────► Download
+```
+
+## 6. FIT file transfer
+
+When a missing file is found, `download_file()` asks the ANT-FS layer to retrieve it:
+
+```python
+data = self.download(fil.get_index(), callback)
+```
+
+The download method receives the remote file index and a progress callback.
+
+The callback converts the transfer progress into a simple ten-character progress indicator:
+
+```text
+Downloading 2012-08-14_17-42-03-01-12345.fit [..........]
+```
+
+After the transfer finishes, the returned byte data is written directly to the generated `.fit` path.
+
+There is no FIT decoding or transformation in this stage. The downloaded data is preserved as a FIT file.
+
+## 7. Post-download scripting
+
+After a FIT file has been written successfully, the extractor invokes:
+
+```python
+self.scriptr.run_download(self.get_filepath(fil))
+```
+
+This is handled by `scripting.py`.
+
+The scripting subsystem scans the configured scripts directory and executes each script with:
+
+```text
+DOWNLOAD <filename>
+```
+
+as its arguments. Script execution occurs in a separate thread, so post-processing does not block the main extraction flow.
+
+The same scripting framework defines actions for:
+
+```text
+DOWNLOAD
+UPLOAD
+DELETE
+```
+
+although upload and delete support are not fully implemented by the main Garmin application.
+
+This design allows external tools to process downloaded activities without modifying the ANT-FS extraction code itself.
+
+## Project structure
+
+```text
+Garmin-Forerunner-610-Extractor/
+│
+├── ant/
+│   ├── base/
+│   ├── easy/
+│   ├── fs/
+│   └── __init__.py
+│
+├── resources/
+│   ├── ant-usbstick2.rules
+│   └── protocol doc.txt
+│
+├── scripts/
+│
+├── garmin.py
+├── scripting.py
+├── utilities.py
+├── uploader.cfg
+├── LICENCE
+└── README
+```
+
+### `garmin.py`
+
+The main application.
+
+Responsibilities include:
+
+* ANT device configuration
+* ANT-FS device discovery
+* link establishment
+* authentication
+* passkey persistence
+* remote directory enumeration
+* local/remote file comparison
+* FIT file downloads
+* progress reporting
+* post-download script execution
+* logging
+
+The repository's `garmin.py` is relatively small because the low-level ANT and ANT-FS protocol implementation is separated into the `ant/` package.
+
+### `ant/`
+
+The protocol implementation.
+
+It contains the lower-level ANT and ANT-FS components used by the Garmin application:
+
+```text
+ant/
+├── base/
+├── easy/
+└── fs/
+```
+
+`garmin.py` consumes the higher-level `ant.fs.manager.Application` interface rather than implementing ANT packet handling itself.
+
+### `scripting.py`
+
+Provides the post-processing hook system.
+
+Scripts are discovered from the application's configuration directory and invoked asynchronously with an action and filename.
+
+### `utilities.py`
+
+Contains small infrastructure helpers, including:
+
+* safe directory creation
+* XDG configuration path resolution
+
+The XDG helper uses `$XDG_CONFIG_HOME` when available and falls back to `$HOME/.config`.
+
+### `resources/`
+
+Contains files required outside the Python implementation.
+
+In particular:
+
+```text
+resources/ant-usbstick2.rules
+```
+
+contains the udev configuration required for normal user access to the ANT USB stick.
+
+The directory also contains protocol documentation used during development.
+
+## Configuration and data paths
+
+The application follows the XDG Base Directory convention.
+
+If `$XDG_CONFIG_HOME` is set:
+
+```text
+$XDG_CONFIG_HOME/garmin-extractor/
+```
+
+is used.
+
+Otherwise:
+
+```text
+~/.config/garmin-extractor/
+```
+
+is used.
+
+A typical installation therefore looks like:
+
+```text
+~/.config/garmin-extractor/
+└── 12345678/
+    ├── authfile
+    └── activities/
+        ├── 2012-05-01_07-31-22-01-8432.fit
+        └── 2012-05-03_18-12-07-01-9120.fit
+```
+
+The exact device directory name is the serial number returned by the watch during authentication.
+
+## Why ANT-FS is important
+
+Older Garmin watches did not necessarily expose themselves as ordinary USB mass-storage devices.
+
+Instead, devices such as the Forerunner 610 could communicate wirelessly through **ANT-FS**, a file-transfer protocol built on top of the ANT wireless transport.
+
+That means the computer does not simply mount the watch and copy:
+
+```text
+/activity.fit
+```
+
+from a filesystem.
+
+The extractor instead performs a protocol exchange:
+
+```text
+ANT radio
+   │
+   ▼
+ANT channel
+   │
+   ▼
+ANT-FS discovery
+   │
+   ▼
+Link
+   │
+   ▼
+Authentication
+   │
+   ▼
+Remote directory
+   │
+   ▼
+Remote file index
+   │
+   ▼
+File transfer
+   │
+   ▼
+FIT file on disk
+```
+
+This protocol-oriented design is the reason the project needs an ANT USB stick and a user-space ANT implementation rather than simply accessing the watch through normal USB filesystem APIs.
+
+## FIT files
+
+The final output is Garmin FIT data.
+
+FIT, or Flexible and Interoperable Data Transfer, is Garmin's binary activity data format. An activity FIT file can contain information such as:
+
+* GPS position
+* timestamp
+* distance
+* speed
+* heart rate
+* cadence
+* laps
+* session information
+* device metadata
+
+This project does not attempt to interpret those records. Its job ends once the original file has been transferred from the ANT-FS device to the local filesystem.
+
+That separation is useful because FIT parsing can be performed independently by tools such as Garmin's FIT SDK or other FIT-compatible libraries.
+
+## Incremental synchronization
+
+The extractor's synchronization model is intentionally simple.
+
+On each run:
+
+1. Discover the watch.
+2. Authenticate.
+3. Request the remote file directory.
+4. Generate the expected local filename for each remote file.
+5. Compare those names against the local activity directory.
+6. Download only files that are not already present.
+
+Conceptually:
+
+```python
+remote_files = watch.list_files()
+local_files = os.listdir(activity_directory)
+
+for remote_file in remote_files:
+    filename = make_filename(remote_file)
+
+    if filename not in local_files:
+        download(remote_file)
+```
+
+This allows the program to be run repeatedly without retransferring activities that have already been archived.
+
+## Logging
+
+The executable creates a timestamped log file when started.
+
+The filename is based on the current time:
+
+```text
+YYYYMMDD-HHMMSS-garmin.log
+```
+
+Logging is configured at debug level, with module, thread, timestamp, severity, message, source file, and line number included in the log format.
+
+This is particularly useful when diagnosing ANT communication or authentication failures, since the visible command-line output only represents the high-level state of the transfer.
+
+## Troubleshooting
+
+### The ANT stick is not detected
+
+Check that the USB device is visible:
+
+```bash
+lsusb
+```
+
+The expected ANTUSB2 identifier is:
+
+```text
+0fcf:1008
+```
+
+If the device is present but inaccessible to the current user, install the supplied udev rule.
+
+### Permission denied when opening the USB device
+
+Install:
+
+```bash
+sudo cp resources/ant-usbstick2.rules /etc/udev/rules.d/
+```
+
+Then reload udev or reconnect the ANT stick.
+
+Running the application as root can work around permission problems, but configuring udev is preferable.
+
+### The watch does not authenticate
+
+On the first connection, the watch must be available for pairing.
+
+The program stores the resulting passkey in:
+
+```text
+~/.config/garmin-extractor/<serial>/authfile
+```
+
+If the authentication state becomes invalid, removing the device-specific `authfile` forces the application to perform pairing again on the next connection.
+
+### Existing activities are downloaded again
+
+The extractor determines whether an activity exists locally from the generated filename. Do not rename downloaded FIT files if you want the built-in duplicate detection to continue working.
+
+### The program crashes immediately on modern Python
+
+This repository is legacy Python software. The source uses Python 2 syntax and an older ANT stack. A current Linux distribution may therefore require a compatibility environment or a port to Python 3 before the original code can run reliably.
+
+This is a limitation of the historical implementation rather than of ANT-FS itself.
+
+## Limitations
+
+This project is deliberately narrow in scope.
+
+It is primarily a downloader, not a complete Garmin device management application.
+
+The current implementation does not provide:
+
+* FIT file parsing
+* activity visualization
+* Garmin Connect synchronization by itself
+* modern Garmin device support
+* a graphical user interface
+* a modern Python package/distribution workflow
+* full upload support
+
+The source also contains an upload path in the transport logic, but it is explicitly left as a TODO rather than being implemented as part of the main application.
+
+## Relationship to `antfs-cli`
+
+This repository is a fork of `Tigge/antfs-cli`, which evolved into a more general ANT-FS command-line interface. The upstream project later moved toward the `openant` library and added features such as optional Garmin Connect and Strava upload integration.
+
+The important architectural lineage is:
+
+```text
+ANT / ANT-FS protocol
+        │
+        ▼
+   antfs-cli
+        │
+        ▼
+Garmin-Forerunner-610-Extractor
+        │
+        ▼
+  Local FIT archive
+```
+
+The fork keeps the original ANT-FS approach while providing a focused Garmin extraction application.
+
+For a more actively developed ANT/ANT-FS implementation, see [`Tigge/openant`](https://github.com/Tigge/openant), which provides a Python ANT and ANT-FS library and supports a broader set of ANT device applications.
+
+## Security considerations
+
+The extractor stores authentication material locally.
+
+The following directory should therefore be treated as private:
+
+```text
+~/.config/garmin-extractor/
+```
+
+In particular:
+
+```text
+authfile
+```
+
+contains the persisted authentication key used to reconnect to the paired device.
+
+Do not commit device authentication files, locally generated logs, or downloaded activity data to source control.
+
+A sensible `.gitignore` should exclude:
+
+```text
+*.log
+authfile
+activities/
+```
+
+when working with the extractor's runtime directory.
+
+## Development notes
+
+The project is structured around a clean separation between protocol handling and application behavior.
+
+The ANT implementation handles communication details, while `Garmin` implements the device-specific application flow:
+
+```text
+ANT protocol implementation
+            │
+            ▼
+     ANT-FS Application
+            │
+            ▼
+        Garmin class
+            │
+     ┌──────┴──────┐
+     ▼             ▼
+Authentication   File transfer
+     │             │
+     ▼             ▼
+ authfile       FIT files
+```
+
+This separation is one of the main reasons the relatively small `garmin.py` file can implement a complete extraction workflow without containing the raw ANT packet machinery.
+
+## Project status
+
+This is legacy software targeting a generation of Garmin devices that used ANT-FS for wireless file transfer.
+
+The repository is useful today primarily for:
+
+* recovering activity data from older ANT-FS Garmin watches
+* understanding ANT-FS device communication
+* studying the implementation of an ANT-FS client
+* preserving access to activity data from discontinued hardware
+* adapting the protocol implementation to newer environments
+
+Modern Garmin devices generally use different connectivity mechanisms, so this project should not be treated as a general-purpose Garmin downloader.
+
+## License
+
+This project is released under the MIT License.
+
+See [`LICENCE`](LICENCE) for the complete license text.
+
+## Credits
+
+The project is based on the work in [`Tigge/antfs-cli`](https://github.com/Tigge/antfs-cli).
+
+The repository's main application code was originally authored by Gustav Tiger and subsequently maintained/forked by contributors including Mario Limonciello.
+
+The ANT/ANT-FS implementation is the core component that makes communication with these older Garmin devices possible.
+
+## See also
+
+* [`Tigge/antfs-cli`](https://github.com/Tigge/antfs-cli) — upstream ANT-FS command-line implementation
+* [`Tigge/openant`](https://github.com/Tigge/openant) — Python ANT and ANT-FS library
+* [`Garmin FIT SDK`](https://github.com/garmin/fit-python-sdk) — tools for working with FIT files after extraction
